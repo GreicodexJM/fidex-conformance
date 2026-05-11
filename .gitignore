@@ -1,0 +1,8 @@
+results/*
+!results/.gitkeep
+*.log
+*.sqlite
+*.db
+*.db-*
+node_modules/
+vendor/

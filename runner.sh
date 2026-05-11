@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# FideX conformance suite — orchestrator.
+#
+# Boots a reference peer (FideX-php) and runs the four test buckets against
+# the configured node under test, then emits a JSON report and an
+# SVG/HTML badge.
+#
+# Usage:
+#   ./runner.sh \
+#       --node-name "MyImplementation 0.4" \
+#       --node-as5-url http://localhost:9000/.well-known/as5-configuration \
+#       --node-id urn:custom:my-impl \
+#       --node-transmit-url http://localhost:9001/api/v1/transmit \
+#       --node-transmit-api-key MY_KEY_32_CHARS \
+#       --node-discover-url http://localhost:9001/admin/dashboard/partners/discover \
+#       --node-db-path /var/lib/mynode/state.sqlite \
+#       --node-messages-table messages \
+#       --node-messages-direction INBOUND \
+#       --profile core
+#
+# Defaults boot the FideX-php node bundled under reference-node/ as the peer.
+
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# ── Defaults ──────────────────────────────────────────────────────────────
+PROFILE=core
+NODE_NAME="UnknownImplementation"
+NODE_AS5_URL=""
+NODE_ID=""
+NODE_TRANSMIT_URL=""
+NODE_TRANSMIT_API_KEY=""
+NODE_DISCOVER_URL=""
+NODE_DISCOVER_API_KEY=""
+NODE_DB_PATH=""
+NODE_MESSAGES_TABLE=messages
+NODE_MESSAGES_DIRECTION=INBOUND
+
+PEER_REPO=${PEER_REPO:-/home/javier/Documents/Projects/Startup_Ideas/FideX-php}
+PEER_PORT=${PEER_PORT:-18081}
+PEER_NODE_ID=urn:custom:fidex-ref-peer
+PEER_API_KEY=conformance-peer-key-32-chars-aaaaaaa
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --node-name) NODE_NAME=$2; shift 2 ;;
+    --node-as5-url) NODE_AS5_URL=$2; shift 2 ;;
+    --node-id) NODE_ID=$2; shift 2 ;;
+    --node-transmit-url) NODE_TRANSMIT_URL=$2; shift 2 ;;
+    --node-transmit-api-key) NODE_TRANSMIT_API_KEY=$2; shift 2 ;;
+    --node-discover-url) NODE_DISCOVER_URL=$2; shift 2 ;;
+    --node-discover-api-key) NODE_DISCOVER_API_KEY=$2; shift 2 ;;
+    --node-db-path) NODE_DB_PATH=$2; shift 2 ;;
+    --node-messages-table) NODE_MESSAGES_TABLE=$2; shift 2 ;;
+    --node-messages-direction) NODE_MESSAGES_DIRECTION=$2; shift 2 ;;
+    --profile) PROFILE=$2; shift 2 ;;
+    --help|-h)
+      head -40 "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ -z "$NODE_AS5_URL" ]] && { echo "--node-as5-url is required" >&2; exit 2; }
+[[ -z "$NODE_ID" ]] && { echo "--node-id is required" >&2; exit 2; }
+
+GREEN=$'\033[0;32m'; RED=$'\033[0;31m'; YEL=$'\033[1;33m'; NC=$'\033[0m'
+say() { printf "${GREEN}[runner]${NC} %s\n" "$*"; }
+warn(){ printf "${YEL}[runner]${NC} %s\n" "$*"; }
+die() { printf "${RED}[runner] %s${NC}\n" "$*" >&2; exit 1; }
+
+WORK=$(mktemp -d /tmp/fidex-conformance.XXXXXX)
+PEER_DIR="$WORK/peer"
+mkdir -p "$PEER_DIR" "$HERE/results"
+
+cleanup() {
+  warn "cleaning up..."
+  pkill -KILL -f "php -S 0.0.0.0:$PEER_PORT" 2>/dev/null || true
+  if [[ -f "$PEER_REPO/.env.bak.conformance" ]]; then
+    mv "$PEER_REPO/.env.bak.conformance" "$PEER_REPO/.env" 2>/dev/null || true
+  fi
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# ── Preflight: port must be free ──────────────────────────────────────────
+if ss -tlnp 2>/dev/null | grep -qE ":${PEER_PORT}\s"; then
+  die "port $PEER_PORT is already in use. Stop the conflicting process or set PEER_PORT to a free port."
+fi
+
+# ── Boot reference peer ───────────────────────────────────────────────────
+say "Starting reference peer (FideX-php) on :$PEER_PORT ..."
+if [[ -f "$PEER_REPO/.env" ]]; then mv "$PEER_REPO/.env" "$PEER_REPO/.env.bak.conformance"; fi
+(cd "$PEER_REPO" \
+  && FIDEX_NODE_ID="$PEER_NODE_ID" \
+     FIDEX_NODE_NAME="FideX Reference Peer" \
+     FIDEX_NODE_BASE_URL="http://localhost:$PEER_PORT" \
+     FIDEX_API_KEY="$PEER_API_KEY" \
+     FIDEX_DB_DRIVER=sqlite \
+     FIDEX_DB_PATH="$PEER_DIR/fidex.sqlite" \
+     FIDEX_ALLOW_HTTP_REGISTRATION=true \
+     nohup php -S 0.0.0.0:"$PEER_PORT" -t "$PEER_REPO/public/" "$PEER_REPO/public/index.php" > "$PEER_DIR/peer.log" 2>&1 &)
+DEADLINE=$((SECONDS + 15))
+until curl -fsS "http://localhost:$PEER_PORT/health" >/dev/null 2>&1; do
+  (( SECONDS > DEADLINE )) && die "reference peer never became healthy. log: $PEER_DIR/peer.log"
+  sleep 0.3
+done
+# Run peer migration (idempotent).
+(cd "$PEER_REPO" \
+  && FIDEX_DB_DRIVER=sqlite \
+     FIDEX_DB_PATH="$PEER_DIR/fidex.sqlite" \
+     php bin/migrate.php >/dev/null 2>&1) || warn "peer migration printed errors"
+
+say "Reference peer healthy at http://localhost:$PEER_PORT"
+
+# ── Export environment for tests ──────────────────────────────────────────
+export NUT_AS5_URL="$NODE_AS5_URL"
+export NUT_NODE_ID="$NODE_ID"
+export NUT_DISCOVER_URL="$NODE_DISCOVER_URL"
+export NUT_DISCOVER_AUTH_HEADER=${NODE_DISCOVER_API_KEY:+Bearer $NODE_DISCOVER_API_KEY}
+export NUT_TRANSMIT_URL="$NODE_TRANSMIT_URL"
+export NUT_TRANSMIT_AUTH_HEADER=${NODE_TRANSMIT_API_KEY:+Bearer $NODE_TRANSMIT_API_KEY}
+export NUT_DB_PATH="$NODE_DB_PATH"
+export NUT_MESSAGES_TABLE="$NODE_MESSAGES_TABLE"
+export NUT_MESSAGES_DIRECTION="$NODE_MESSAGES_DIRECTION"
+
+export PEER_AS5_URL="http://localhost:$PEER_PORT/as5/config"
+export PEER_NODE_ID
+export PEER_REGISTER_URL="http://localhost:$PEER_PORT/api/v1/partners/register"
+export PEER_REGISTER_AUTH_HEADER="Bearer $PEER_API_KEY"
+export PEER_DB_PATH="$PEER_DIR/fidex.sqlite"
+export PEER_PARTNERS_TABLE=fidex_partners
+export PEER_PARTNERS_ID_COL=partner_id
+export PEER_MESSAGES_TABLE=fidex_messages
+export PEER_MESSAGES_DIRECTION=inbound
+export PEER_TRANSMIT_URL="http://localhost:$PEER_PORT/api/v1/transmit"
+export PEER_TRANSMIT_AUTH_HEADER="Bearer $PEER_API_KEY"
+# Worker is wrapped in `timeout 60s` so a delivery loop that won't terminate
+# (dead endpoint, infinite retry, etc.) can't lock up the suite. 60s covers
+# the PHP cURL client's default 30s timeout plus worker bootstrap.
+export PEER_WORKER_CMD="cd '$PEER_REPO' && FIDEX_NODE_ID='$PEER_NODE_ID' FIDEX_NODE_NAME='FideX Reference Peer' FIDEX_NODE_BASE_URL='http://localhost:$PEER_PORT' FIDEX_API_KEY='$PEER_API_KEY' FIDEX_DB_DRIVER=sqlite FIDEX_DB_PATH='$PEER_DIR/fidex.sqlite' FIDEX_ALLOW_HTTP_REGISTRATION=true timeout 60s php bin/worker.php"
+
+# ── Run each test bucket, collect verdicts ────────────────────────────────
+case "$PROFILE" in
+  core)     BUCKETS=("01-discovery" "02-registration" "03-transmit" "04-receive") ;;
+  enhanced) BUCKETS=("01-discovery" "02-registration" "03-transmit" "04-receive" "05-receipts" "06-errors") ;;
+  edge)     BUCKETS=("01-discovery" "02-registration" "03-transmit" "04-receive" "05-receipts" "06-errors" "07-security") ;;
+  *) die "unknown profile: $PROFILE" ;;
+esac
+
+declare -A BUCKET_EXIT
+for bucket in "${BUCKETS[@]}"; do
+  script="$HERE/tests/${bucket}.sh"
+  if [[ ! -x "$script" ]]; then
+    warn "bucket $bucket script missing ($script) — counted as fail"
+    BUCKET_EXIT["$bucket"]=2
+    continue
+  fi
+  printf "\n%s───── %s ─────%s\n" "$YEL" "$bucket" "$NC"
+  "$script"; BUCKET_EXIT["$bucket"]=$?
+done
+
+# ── Verdict ───────────────────────────────────────────────────────────────
+OVERALL=PASS
+FAIL_LIST=""
+for bucket in "${BUCKETS[@]}"; do
+  if [[ "${BUCKET_EXIT[$bucket]:-1}" -ne 0 ]]; then
+    OVERALL=FAIL
+    FAIL_LIST="$FAIL_LIST $bucket"
+  fi
+done
+
+RUN_ID=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+REPORT_JSON="$HERE/results/conformance-report.json"
+BADGE_SVG="$HERE/results/badge.svg"
+
+# Build the JSON report.
+{
+  echo "{"
+  echo "  \"schema\": \"fidex-conformance/v1\","
+  echo "  \"run_id\": \"$RUN_ID\","
+  echo "  \"implementation\": {"
+  echo "    \"name\": \"$NODE_NAME\","
+  echo "    \"node_id\": \"$NODE_ID\","
+  echo "    \"as5_url\": \"$NODE_AS5_URL\""
+  echo "  },"
+  echo "  \"spec_version\": \"1.0\","
+  echo "  \"profile\": \"$PROFILE\","
+  echo "  \"buckets\": ["
+  first=1
+  for bucket in "${BUCKETS[@]}"; do
+    code=${BUCKET_EXIT[$bucket]:-1}
+    result=$([[ "$code" -eq 0 ]] && echo PASS || echo FAIL)
+    [[ $first -eq 0 ]] && echo ","
+    first=0
+    printf "    {\"id\": \"%s\", \"exit_code\": %s, \"result\": \"%s\"}" \
+      "$bucket" "$code" "$result"
+  done
+  echo ""
+  echo "  ],"
+  echo "  \"verdict\": \"$OVERALL\""
+  echo "}"
+} > "$REPORT_JSON"
+
+# Compose badge.
+COLOUR=$([[ "$OVERALL" == "PASS" ]] && echo "#4c1" || echo "#e05d44")
+LABEL="FideX $PROFILE"
+VALUE=$([[ "$OVERALL" == "PASS" ]] && echo "compliant" || echo "non-compliant")
+cat > "$BADGE_SVG" <<SVG
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="20">
+  <linearGradient id="g" x2="0" y2="100%">
+    <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
+    <stop offset="1" stop-opacity=".1"/>
+  </linearGradient>
+  <rect rx="3" width="200" height="20" fill="#555"/>
+  <rect rx="3" x="90" width="110" height="20" fill="$COLOUR"/>
+  <rect rx="3" width="200" height="20" fill="url(#g)"/>
+  <g fill="#fff" text-anchor="middle" font-family="DejaVu Sans,Verdana,sans-serif" font-size="11">
+    <text x="45" y="14">$LABEL</text>
+    <text x="145" y="14">$VALUE</text>
+  </g>
+</svg>
+SVG
+
+echo
+printf "%s════════════════════════════════════════════════%s\n" "$YEL" "$NC"
+if [[ "$OVERALL" == "PASS" ]]; then
+  printf "${GREEN}✓ %s certified FideX 1.0 (%s profile)${NC}\n" "$NODE_NAME" "$PROFILE"
+else
+  printf "${RED}✗ %s NOT compliant. Failed buckets:%s${NC}\n" "$NODE_NAME" "$FAIL_LIST"
+fi
+echo
+echo "Report : $REPORT_JSON"
+echo "Badge  : $BADGE_SVG"
+echo
+[[ "$OVERALL" == "PASS" ]] && exit 0 || exit 1
