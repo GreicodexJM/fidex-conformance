@@ -42,7 +42,7 @@ AUTH_HDR=()
 RESP=$(curl -fsS -X POST "$PEER_REGISTER_URL" \
   "${AUTH_HDR[@]}" \
   -H "Content-Type: application/json" \
-  -d "{\"as5_config_url\":\"$NUT_AS5_URL\"}" 2>&1) || {
+  -d "{\"as5_config_url\":\"$NUT_AS5_URL\",\"discovery_url\":\"$NUT_AS5_URL\"}" 2>&1) || {
   fail 02.01 "Reference peer can register NUT from AS5 URL" "$RESP"
   RESP=""
 }

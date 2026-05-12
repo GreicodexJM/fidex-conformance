@@ -36,8 +36,11 @@ NODE_DB_PATH=""
 NODE_MESSAGES_TABLE=messages
 NODE_MESSAGES_DIRECTION=INBOUND
 
+PEER_TYPE=${PEER_TYPE:-php}
 PEER_REPO=${PEER_REPO:-/home/javier/Documents/Projects/Startup_Ideas/FideX-php}
 PEER_PORT=${PEER_PORT:-18081}
+# Go peer exposes a second (internal) port for the transmit/admin API.
+PEER_INTERNAL_PORT=${PEER_INTERNAL_PORT:-19082}
 PEER_NODE_ID=urn:custom:fidex-ref-peer
 PEER_API_KEY=conformance-peer-key-32-chars-aaaaaaa
 
@@ -53,6 +56,10 @@ while [[ $# -gt 0 ]]; do
     --node-db-path) NODE_DB_PATH=$2; shift 2 ;;
     --node-messages-table) NODE_MESSAGES_TABLE=$2; shift 2 ;;
     --node-messages-direction) NODE_MESSAGES_DIRECTION=$2; shift 2 ;;
+    --peer-type) PEER_TYPE=$2; shift 2 ;;
+    --peer-repo) PEER_REPO=$2; shift 2 ;;
+    --peer-port) PEER_PORT=$2; shift 2 ;;
+    --peer-internal-port) PEER_INTERNAL_PORT=$2; shift 2 ;;
     --profile) PROFILE=$2; shift 2 ;;
     --help|-h)
       head -40 "$0" | sed 's/^# \{0,1\}//'
@@ -60,6 +67,11 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
+
+case "$PEER_TYPE" in
+  php|go) ;;
+  *) echo "--peer-type must be 'php' or 'go' (got: $PEER_TYPE)" >&2; exit 2 ;;
+esac
 
 [[ -z "$NODE_AS5_URL" ]] && { echo "--node-as5-url is required" >&2; exit 2; }
 [[ -z "$NODE_ID" ]] && { echo "--node-id is required" >&2; exit 2; }
@@ -75,48 +87,95 @@ mkdir -p "$PEER_DIR" "$HERE/results"
 
 cleanup() {
   warn "cleaning up..."
-  pkill -KILL -f "php -S 0.0.0.0:$PEER_PORT" 2>/dev/null || true
-  if [[ -f "$PEER_REPO/.env.bak.conformance" ]]; then
-    mv "$PEER_REPO/.env.bak.conformance" "$PEER_REPO/.env" 2>/dev/null || true
+  if [[ "$PEER_TYPE" == "php" ]]; then
+    pkill -KILL -f "php -S 0.0.0.0:$PEER_PORT" 2>/dev/null || true
+    if [[ -f "$PEER_REPO/.env.bak.conformance" ]]; then
+      mv "$PEER_REPO/.env.bak.conformance" "$PEER_REPO/.env" 2>/dev/null || true
+    fi
+  else
+    [[ -n "${PEER_PID:-}" ]] && kill -KILL "$PEER_PID" 2>/dev/null || true
+    pkill -KILL -f "$PEER_DIR/fidex-node" 2>/dev/null || true
   fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
-# ── Preflight: port must be free ──────────────────────────────────────────
+# ── Preflight: ports must be free ─────────────────────────────────────────
 if ss -tlnp 2>/dev/null | grep -qE ":${PEER_PORT}\s"; then
   die "port $PEER_PORT is already in use. Stop the conflicting process or set PEER_PORT to a free port."
 fi
+if [[ "$PEER_TYPE" == "go" ]] && ss -tlnp 2>/dev/null | grep -qE ":${PEER_INTERNAL_PORT}\s"; then
+  die "port $PEER_INTERNAL_PORT (peer internal) is in use. Set PEER_INTERNAL_PORT to a free port."
+fi
 
 # ── Boot reference peer ───────────────────────────────────────────────────
-say "Starting reference peer (FideX-php) on :$PEER_PORT ..."
-if [[ -f "$PEER_REPO/.env" ]]; then mv "$PEER_REPO/.env" "$PEER_REPO/.env.bak.conformance"; fi
-(cd "$PEER_REPO" \
-  && FIDEX_NODE_ID="$PEER_NODE_ID" \
-     FIDEX_NODE_NAME="FideX Reference Peer" \
-     FIDEX_NODE_BASE_URL="http://localhost:$PEER_PORT" \
-     FIDEX_API_KEY="$PEER_API_KEY" \
-     FIDEX_DB_DRIVER=sqlite \
-     FIDEX_DB_PATH="$PEER_DIR/fidex.sqlite" \
-     FIDEX_ALLOW_HTTP_REGISTRATION=true \
-     nohup php -S 0.0.0.0:"$PEER_PORT" -t "$PEER_REPO/public/" "$PEER_REPO/public/index.php" > "$PEER_DIR/peer.log" 2>&1 &)
-DEADLINE=$((SECONDS + 15))
-until curl -fsS "http://localhost:$PEER_PORT/health" >/dev/null 2>&1; do
-  if (( SECONDS > DEADLINE )); then
-    printf "%s---- peer.log (last 50 lines) ----%s\n" "$RED" "$NC" >&2
-    tail -50 "$PEER_DIR/peer.log" >&2 2>/dev/null || echo "(peer.log absent)" >&2
-    printf "%s---- end peer.log ----%s\n" "$RED" "$NC" >&2
-    die "reference peer never became healthy"
+if [[ "$PEER_TYPE" == "php" ]]; then
+  say "Starting reference peer (FideX-php) on :$PEER_PORT ..."
+  if [[ -f "$PEER_REPO/.env" ]]; then mv "$PEER_REPO/.env" "$PEER_REPO/.env.bak.conformance"; fi
+  (cd "$PEER_REPO" \
+    && FIDEX_NODE_ID="$PEER_NODE_ID" \
+       FIDEX_NODE_NAME="FideX Reference Peer" \
+       FIDEX_NODE_BASE_URL="http://localhost:$PEER_PORT" \
+       FIDEX_API_KEY="$PEER_API_KEY" \
+       FIDEX_DB_DRIVER=sqlite \
+       FIDEX_DB_PATH="$PEER_DIR/fidex.sqlite" \
+       FIDEX_ALLOW_HTTP_REGISTRATION=true \
+       nohup php -S 0.0.0.0:"$PEER_PORT" -t "$PEER_REPO/public/" "$PEER_REPO/public/index.php" > "$PEER_DIR/peer.log" 2>&1 &)
+  DEADLINE=$((SECONDS + 15))
+  until curl -fsS "http://localhost:$PEER_PORT/health" >/dev/null 2>&1; do
+    if (( SECONDS > DEADLINE )); then
+      printf "%s---- peer.log (last 50 lines) ----%s\n" "$RED" "$NC" >&2
+      tail -50 "$PEER_DIR/peer.log" >&2 2>/dev/null || echo "(peer.log absent)" >&2
+      printf "%s---- end peer.log ----%s\n" "$RED" "$NC" >&2
+      die "reference peer never became healthy"
+    fi
+    sleep 0.3
+  done
+  # Run peer migration (idempotent).
+  (cd "$PEER_REPO" \
+    && FIDEX_DB_DRIVER=sqlite \
+       FIDEX_DB_PATH="$PEER_DIR/fidex.sqlite" \
+       php bin/migrate.php >/dev/null 2>&1) || warn "peer migration printed errors"
+  say "Reference peer healthy at http://localhost:$PEER_PORT"
+else
+  # Go reference peer. Expects a pre-built binary at $PEER_REPO/fidex-node or
+  # builds one on the fly when the source tree is present.
+  PEER_BIN="$PEER_REPO/fidex-node"
+  if [[ ! -x "$PEER_BIN" ]]; then
+    if command -v go >/dev/null 2>&1 && [[ -d "$PEER_REPO/cmd/fidex-node" ]]; then
+      say "Building Go reference peer..."
+      (cd "$PEER_REPO" && go build -o fidex-node ./cmd/fidex-node) \
+        || die "go build failed in $PEER_REPO"
+    else
+      die "Go peer binary not found at $PEER_BIN and 'go' is unavailable. Build it first."
+    fi
   fi
-  sleep 0.3
-done
-# Run peer migration (idempotent).
-(cd "$PEER_REPO" \
-  && FIDEX_DB_DRIVER=sqlite \
-     FIDEX_DB_PATH="$PEER_DIR/fidex.sqlite" \
-     php bin/migrate.php >/dev/null 2>&1) || warn "peer migration printed errors"
-
-say "Reference peer healthy at http://localhost:$PEER_PORT"
+  say "Starting reference peer (FideX-go) on public:$PEER_PORT internal:$PEER_INTERNAL_PORT ..."
+  mkdir -p "$PEER_DIR/keys"
+  (cd "$PEER_DIR" \
+    && FIDEX_NODE_ID="$PEER_NODE_ID" \
+       FIDEX_ORG_NAME="FideX Reference Peer (Go)" \
+       FIDEX_PUBLIC_DOMAIN="localhost:$PEER_PORT" \
+       FIDEX_PUBLIC_PORT="$PEER_PORT" \
+       FIDEX_INTERNAL_PORT="$PEER_INTERNAL_PORT" \
+       FIDEX_API_KEY="$PEER_API_KEY" \
+       FIDEX_ENABLE_IP_ALLOWLIST=false \
+       FIDEX_DB_PATH="$PEER_DIR/fidex.sqlite" \
+       FIDEX_PRIVATE_KEY_PATH="$PEER_DIR/keys/private_key.pem" \
+       FIDEX_PUBLIC_KEY_PATH="$PEER_DIR/keys/public_key.pem" \
+       setsid "$PEER_BIN" > "$PEER_DIR/peer.log" 2>&1 < /dev/null &)
+  DEADLINE=$((SECONDS + 20))
+  until curl -fsS "http://localhost:$PEER_PORT/health" >/dev/null 2>&1; do
+    if (( SECONDS > DEADLINE )); then
+      printf "%s---- peer.log (last 50 lines) ----%s\n" "$RED" "$NC" >&2
+      tail -50 "$PEER_DIR/peer.log" >&2 2>/dev/null || echo "(peer.log absent)" >&2
+      printf "%s---- end peer.log ----%s\n" "$RED" "$NC" >&2
+      die "reference peer never became healthy"
+    fi
+    sleep 0.3
+  done
+  say "Reference peer healthy at http://localhost:$PEER_PORT"
+fi
 
 # ── Export environment for tests ──────────────────────────────────────────
 export NUT_AS5_URL="$NODE_AS5_URL"
@@ -129,21 +188,41 @@ export NUT_DB_PATH="$NODE_DB_PATH"
 export NUT_MESSAGES_TABLE="$NODE_MESSAGES_TABLE"
 export NUT_MESSAGES_DIRECTION="$NODE_MESSAGES_DIRECTION"
 
-export PEER_AS5_URL="http://localhost:$PEER_PORT/as5/config"
 export PEER_NODE_ID
-export PEER_REGISTER_URL="http://localhost:$PEER_PORT/api/v1/partners/register"
-export PEER_REGISTER_AUTH_HEADER="Bearer $PEER_API_KEY"
 export PEER_DB_PATH="$PEER_DIR/fidex.sqlite"
-export PEER_PARTNERS_TABLE=fidex_partners
-export PEER_PARTNERS_ID_COL=partner_id
-export PEER_MESSAGES_TABLE=fidex_messages
-export PEER_MESSAGES_DIRECTION=inbound
-export PEER_TRANSMIT_URL="http://localhost:$PEER_PORT/api/v1/transmit"
-export PEER_TRANSMIT_AUTH_HEADER="Bearer $PEER_API_KEY"
-# Worker is wrapped in `timeout 60s` so a delivery loop that won't terminate
-# (dead endpoint, infinite retry, etc.) can't lock up the suite. 60s covers
-# the PHP cURL client's default 30s timeout plus worker bootstrap.
-export PEER_WORKER_CMD="cd '$PEER_REPO' && FIDEX_NODE_ID='$PEER_NODE_ID' FIDEX_NODE_NAME='FideX Reference Peer' FIDEX_NODE_BASE_URL='http://localhost:$PEER_PORT' FIDEX_API_KEY='$PEER_API_KEY' FIDEX_DB_DRIVER=sqlite FIDEX_DB_PATH='$PEER_DIR/fidex.sqlite' FIDEX_ALLOW_HTTP_REGISTRATION=true timeout 60s php bin/worker.php"
+
+if [[ "$PEER_TYPE" == "php" ]]; then
+  export PEER_AS5_URL="http://localhost:$PEER_PORT/as5/config"
+  export PEER_REGISTER_URL="http://localhost:$PEER_PORT/api/v1/partners/register"
+  export PEER_REGISTER_AUTH_HEADER="Bearer $PEER_API_KEY"
+  export PEER_PARTNERS_TABLE=fidex_partners
+  export PEER_PARTNERS_ID_COL=partner_id
+  export PEER_MESSAGES_TABLE=fidex_messages
+  export PEER_MESSAGES_DIRECTION=inbound
+  export PEER_TRANSMIT_URL="http://localhost:$PEER_PORT/api/v1/transmit"
+  export PEER_TRANSMIT_AUTH_HEADER="Bearer $PEER_API_KEY"
+  # Worker is wrapped in `timeout 60s` so a delivery loop that won't terminate
+  # (dead endpoint, infinite retry, etc.) can't lock up the suite. 60s covers
+  # the PHP cURL client's default 30s timeout plus worker bootstrap.
+  export PEER_WORKER_CMD="cd '$PEER_REPO' && FIDEX_NODE_ID='$PEER_NODE_ID' FIDEX_NODE_NAME='FideX Reference Peer' FIDEX_NODE_BASE_URL='http://localhost:$PEER_PORT' FIDEX_API_KEY='$PEER_API_KEY' FIDEX_DB_DRIVER=sqlite FIDEX_DB_PATH='$PEER_DIR/fidex.sqlite' FIDEX_ALLOW_HTTP_REGISTRATION=true timeout 60s php bin/worker.php"
+else
+  # Go peer: AS5 config is published at /.well-known/as5-configuration, the
+  # registration endpoint is the public /api/v1/register, but discover-by-URL
+  # is the internal /admin/dashboard/partners/discover. Tables follow the Go
+  # schema (`messages`, `trading_partners`).
+  export PEER_AS5_URL="http://localhost:$PEER_PORT/.well-known/as5-configuration"
+  export PEER_REGISTER_URL="http://localhost:$PEER_INTERNAL_PORT/admin/dashboard/partners/discover"
+  export PEER_REGISTER_AUTH_HEADER="Bearer $PEER_API_KEY"
+  export PEER_PARTNERS_TABLE=trading_partners
+  export PEER_PARTNERS_ID_COL=partner_id
+  export PEER_MESSAGES_TABLE=messages
+  export PEER_MESSAGES_DIRECTION=INBOUND
+  export PEER_TRANSMIT_URL="http://localhost:$PEER_INTERNAL_PORT/api/v1/transmit"
+  export PEER_TRANSMIT_AUTH_HEADER="Bearer $PEER_API_KEY"
+  # Go peer ships an in-process queue worker — no external worker step needed.
+  # Provide a no-op so test buckets that conditionally invoke it stay portable.
+  export PEER_WORKER_CMD="true"
+fi
 
 # ── Run each test bucket, collect verdicts ────────────────────────────────
 case "$PROFILE" in
