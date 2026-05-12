@@ -98,7 +98,7 @@ while (( SECONDS < DEADLINE )); do
     "SELECT status FROM $PEER_MESSAGES_TABLE WHERE direction='outbound' AND message_id='$PEER_OUTBOUND_ID' LIMIT 1;" \
     2>/dev/null || echo "")
   case "$OUTBOUND_STATUS" in
-    delivered|DELIVERED|completed|COMPLETED) break ;;
+    delivered|DELIVERED|completed|COMPLETED|acknowledged|ACKNOWLEDGED) break ;;
   esac
   # Worker is one-shot — re-drain so any newly-enqueued process_receipt
   # job (peer received the J-MDN POST and queued reconciliation) actually
@@ -108,7 +108,7 @@ while (( SECONDS < DEADLINE )); do
 done
 
 case "$OUTBOUND_STATUS" in
-  delivered|DELIVERED|completed|COMPLETED)
+  delivered|DELIVERED|completed|COMPLETED|acknowledged|ACKNOWLEDGED)
     pass 05.03 "NUT emitted J-MDN; peer reconciled outbound status=$OUTBOUND_STATUS"
     ;;
   "")
