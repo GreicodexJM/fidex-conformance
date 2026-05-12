@@ -65,15 +65,53 @@ fi
 # 03.02-03.04 — Wait for peer to record the inbound message. NUT must
 # encrypt + envelope + deliver, peer must decrypt + persist. We verify by
 # polling the peer's DB for a fresh inbound row.
-DEADLINE=$((SECONDS + 30))
+#
+# Snapshot the peer's existing inbound message_ids BEFORE kicking the NUT
+# worker so we can detect the *new* row even if previous buckets left
+# stale rows behind. Filtering by message_id delta is portable across
+# implementations — PHP exposes a sender_id column but Go embeds the
+# sender id inside the payload JSON, so we can't safely filter on it.
+BASELINE_FILE=$(mktemp)
+sqlite3 "$PEER_DB_PATH" \
+  "SELECT message_id FROM $PEER_MESSAGES_TABLE WHERE direction='$PEER_MESSAGES_DIRECTION';" \
+  2>/dev/null | sort -u > "$BASELINE_FILE" || true
+CURRENT_FILE=$(mktemp)
+
+# Some implementations (notably PHP nodes whose queue worker is a cron job
+# rather than an in-process loop) accept the transmit request immediately
+# but only build + send the envelope when their worker runs. The runner
+# exports NUT_WORKER_CMD when the NUT needs to be kicked between phases;
+# we drain it as a *background* process so the polling loop can observe
+# its progress without blocking on a slow encrypt. The 60s budget matches
+# the worker's internal timeout used by the runner so even a pure-PHP
+# RSA-OAEP sign+encrypt at 4096-bit on slow hardware can finish inside
+# one iteration.
+NUT_WORKER_PID=""
+if [[ -n "${NUT_WORKER_CMD:-}" ]]; then
+  bash -c "$NUT_WORKER_CMD" >/dev/null 2>&1 &
+  NUT_WORKER_PID=$!
+fi
+
+DEADLINE=$((SECONDS + 60))
 DELIVERED=0
+COUNT=0
 while (( SECONDS < DEADLINE )); do
-  COUNT=$(sqlite3 "$PEER_DB_PATH" \
-    "SELECT COUNT(*) FROM $PEER_MESSAGES_TABLE WHERE direction='$PEER_MESSAGES_DIRECTION' AND sender_id='$NUT_NODE_ID';" \
-    2>/dev/null || echo "0")
+  sqlite3 "$PEER_DB_PATH" \
+    "SELECT message_id FROM $PEER_MESSAGES_TABLE WHERE direction='$PEER_MESSAGES_DIRECTION';" \
+    2>/dev/null | sort -u > "$CURRENT_FILE" || true
+  COUNT=$(comm -13 "$BASELINE_FILE" "$CURRENT_FILE" | wc -l)
   if [[ "$COUNT" -ge 1 ]]; then DELIVERED=1; break; fi
+  # Re-kick the NUT worker if our background drain has exited but the
+  # peer's table is still empty — drains are one-shot, so we need a new
+  # process each pass to walk any remaining transmit jobs.
+  if [[ -n "${NUT_WORKER_CMD:-}" ]] && ! kill -0 "$NUT_WORKER_PID" 2>/dev/null; then
+    bash -c "$NUT_WORKER_CMD" >/dev/null 2>&1 &
+    NUT_WORKER_PID=$!
+  fi
   sleep 0.5
 done
+[[ -n "$NUT_WORKER_PID" ]] && kill "$NUT_WORKER_PID" 2>/dev/null || true
+rm -f "$BASELINE_FILE" "$CURRENT_FILE"
 
 if [[ $DELIVERED -eq 1 ]]; then
   pass 03.02 "NUT produced a deliverable JWE envelope"
@@ -81,7 +119,7 @@ if [[ $DELIVERED -eq 1 ]]; then
   pass 03.04 "Peer received and persisted the inbound message ($COUNT row)"
 else
   fail 03.02 "NUT delivered the encrypted envelope to peer" \
-    "no inbound row in $PEER_MESSAGES_TABLE within 30s (sender_id=$NUT_NODE_ID)"
+    "no new inbound row in $PEER_MESSAGES_TABLE within 30s (sender_id=$NUT_NODE_ID — check NUT outbound worker)"
 fi
 
 print_bucket_summary 03 Transmit
