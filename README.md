@@ -7,9 +7,12 @@ The suite is modelled after the [Drummond Group](https://www.drummondgroup.com/)
 interoperability certification programs used in AS2/AS4/ebMS — adapted for an
 open, vendor-neutral OSS workflow.
 
-> **Status:** Phase 0 (alpha). Currently exercises Discovery, Registration,
-> and bidirectional encrypted Transmit. Receipts (J-MDN) and error handling
-> are on the roadmap.
+> **Status:** Phase 1 (beta). All three conformance profiles are
+> implemented: `core` (discovery + registration + transmit + receive),
+> `enhanced` (+ J-MDN receipts + error semantics), `edge` (+ active
+> security probes). Reference verdict: FideXNode (Go) `master` certified
+> at `core` (17/17); gaps for `enhanced`/`edge` documented in its
+> CONFORMANCE.md.
 
 ## What "FideX Conformant" means
 
@@ -25,20 +28,26 @@ Implementations get back a single artifact:
 ## Quick start
 
 ```bash
-# Run the entire suite against your local node under test.
+# Run the full edge profile against your local node under test.
 ./runner.sh \
-    --node-under-test-as5 http://your-node:port/.well-known/as5-configuration \
-    --node-under-test-id  urn:custom:your-node \
-    --node-under-test-tx  http://your-node:port/api/v1/transmit \
-    --node-under-test-api-key your-internal-key
+    --node-name      "MyImpl 1.0" \
+    --node-as5-url   http://your-node:port/.well-known/as5-configuration \
+    --node-id        urn:custom:your-node \
+    --node-transmit-url      http://your-node:port/api/v1/transmit \
+    --node-transmit-api-key  your-internal-key \
+    --node-discover-url      http://your-node:port/admin/dashboard/partners/discover \
+    --node-discover-api-key  your-internal-key \
+    --node-db-path   /path/to/your-node.sqlite \
+    --profile        edge       # or 'core' / 'enhanced'
 
-# Or run a single test bucket:
-./tests/01-discovery.sh
-
-# Or run against the bundled reference peer (PHP node, started via
-# reference-node/docker-compose.yml):
-./runner.sh --use-reference-peer
+# Outputs:
+#   results/conformance-report.json   — full per-bucket verdict
+#   results/badge.svg                 — embeddable "FideX 1.0 Compliant" badge
 ```
+
+The runner auto-boots the bundled FideX-php reference peer on
+`localhost:18081`; set `PEER_REPO=/path/to/FideX-php` if your checkout
+lives elsewhere. Override `PEER_PORT` if 18081 is taken.
 
 The reference peer is the canonical
 [FideX-php](https://github.com/GreicodexJM/fidex-protocol) node. Vendors who
@@ -59,9 +68,9 @@ FideX-conformance/
 │   ├── 02-registration.sh        # both directions of partner onboarding
 │   ├── 03-transmit.sh            # outbound JWE delivery (NUT → peer)
 │   ├── 04-receive.sh             # inbound JWE decryption (peer → NUT)
-│   ├── 05-receipts.sh            # signed J-MDN exchange       [planned]
-│   ├── 06-errors.sh              # malformed envelope, unknown sender [planned]
-│   ├── 07-security.sh            # min-key-size, alg whitelist [planned]
+│   ├── 05-receipts.sh            # signed J-MDN round-trip (spec §7)
+│   ├── 06-errors.sh              # malformed/unknown/replay/tampered (§8)
+│   ├── 07-security.sh            # min-key-size, alg whitelist, HTTPS, replay (§5/§9)
 │   └── lib/
 │       └── assertions.sh         # check_as5_config, check_jwks_enc, …
 ├── report-templates/
