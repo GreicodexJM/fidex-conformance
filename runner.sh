@@ -16,7 +16,15 @@
 #       --node-db-path /var/lib/mynode/state.sqlite \
 #       --node-messages-table messages \
 #       --node-messages-direction INBOUND \
+#       --node-worker-cmd "cd /repo && php bin/worker.php" \
 #       --profile core
+#
+# --node-worker-cmd is OPTIONAL. Implementations whose queue worker runs
+# in-process (e.g. the Go reference node polls its queue every 10s) can
+# omit it. Implementations that run their worker as a cron job (e.g. the
+# PHP reference node's bin/worker.php) MUST pass a drain command so the
+# transmit + receive buckets can advance the NUT's outbound and inbound
+# queues between phases.
 #
 # Defaults boot the FideX-php node bundled under reference-node/ as the peer.
 
@@ -35,6 +43,12 @@ NODE_DISCOVER_API_KEY=""
 NODE_DB_PATH=""
 NODE_MESSAGES_TABLE=messages
 NODE_MESSAGES_DIRECTION=INBOUND
+# NUT_WORKER_CMD lets implementations whose queue worker is NOT in-process
+# (e.g. fidex-php's bin/worker.php cron) advance their outbound + inbound
+# queue between test phases. Implementations that already run a background
+# worker (Go) can leave this empty — the test buckets treat empty as a
+# no-op and trust the in-process loop to drain.
+NODE_WORKER_CMD=""
 
 PEER_TYPE=${PEER_TYPE:-php}
 PEER_REPO=${PEER_REPO:-/home/javier/Documents/Projects/Startup_Ideas/FideX-php}
@@ -56,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --node-db-path) NODE_DB_PATH=$2; shift 2 ;;
     --node-messages-table) NODE_MESSAGES_TABLE=$2; shift 2 ;;
     --node-messages-direction) NODE_MESSAGES_DIRECTION=$2; shift 2 ;;
+    --node-worker-cmd) NODE_WORKER_CMD=$2; shift 2 ;;
     --peer-type) PEER_TYPE=$2; shift 2 ;;
     --peer-repo) PEER_REPO=$2; shift 2 ;;
     --peer-port) PEER_PORT=$2; shift 2 ;;
@@ -212,6 +227,10 @@ export NUT_TRANSMIT_AUTH_HEADER=${NODE_TRANSMIT_API_KEY:+Bearer $NODE_TRANSMIT_A
 export NUT_DB_PATH="$NODE_DB_PATH"
 export NUT_MESSAGES_TABLE="$NODE_MESSAGES_TABLE"
 export NUT_MESSAGES_DIRECTION="$NODE_MESSAGES_DIRECTION"
+# Implementations that lack an in-process queue worker (PHP cron) pass
+# their drain command here so the transmit/receive buckets can advance
+# the NUT's outbound + inbound queues between phases.
+export NUT_WORKER_CMD="$NODE_WORKER_CMD"
 
 export PEER_NODE_ID
 export PEER_DB_PATH="$PEER_DIR/fidex.sqlite"

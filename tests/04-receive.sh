@@ -67,13 +67,22 @@ RESP=$(curl -fsS -X POST "$PEER_TRANSMIT_URL" \
 }
 pass 04.01 "Peer queued outbound message destined for NUT"
 
-# Capture id baseline BEFORE the worker delivers, so we can distinguish the
-# new inbound row from any that already existed (e.g. a receipt persisted
-# during bucket 03). id-delta is more portable than timestamp comparisons —
-# implementations use wildly different created_at formats.
-BASELINE_MAX_ID=$(sqlite3 "$NUT_DB_PATH" \
-  "SELECT COALESCE(MAX(id),0) FROM $NUT_MESSAGES_TABLE WHERE direction='$NUT_MESSAGES_DIRECTION';" \
-  2>/dev/null || echo "0")
+# Capture a baseline of existing inbound message_ids BEFORE the peer
+# delivers, so we can distinguish the new inbound row from any that
+# already existed (e.g. a receipt persisted during bucket 03).
+#
+# We previously used `MAX(id)` here, but that only works on schemas with
+# an integer auto-increment `id` column. The PHP reference node keys
+# fidex_messages by `message_id` (TEXT) and has no `id` column, so the
+# baseline query failed silently and the test reported a false negative
+# even when the peer's envelope had arrived and been persisted. The new
+# strategy is portable: snapshot the existing message_id set, then look
+# for any message_id present after the worker drain that wasn't in the
+# baseline.
+BASELINE_FILE=$(mktemp)
+sqlite3 "$NUT_DB_PATH" \
+  "SELECT message_id FROM $NUT_MESSAGES_TABLE WHERE direction='$NUT_MESSAGES_DIRECTION';" \
+  2>/dev/null | sort -u > "$BASELINE_FILE" || true
 
 # 04.02 — Drain peer's queue worker (one-shot).
 if WORKER_OUT=$(bash -c "$PEER_WORKER_CMD" 2>&1); then
@@ -84,30 +93,76 @@ fi
 
 # 04.03 — Verify NUT persisted a fresh inbound row with DELIVERED status
 # (implies successful decrypt + verify).
+#
+# Implementations whose inbound pipeline is asynchronous (PHP enqueues a
+# process_inbound job, then the cron worker advances status to DELIVERED)
+# need their worker drained between the envelope arrival and the status
+# check. We kick NUT_WORKER_CMD as a *background* process so the polling
+# loop can observe its progress without blocking on a slow decrypt. The
+# 60s budget matches the worker's internal timeout used by the runner so
+# even a pure-PHP RSA-OAEP decrypt at 4096-bit on slow hardware can finish
+# inside one iteration. For in-process workers (Go) NUT_WORKER_CMD is
+# empty and the loop just polls.
+CURRENT_FILE=$(mktemp)
+NUT_WORKER_PID=""
+if [[ -n "${NUT_WORKER_CMD:-}" ]]; then
+  bash -c "$NUT_WORKER_CMD" >/dev/null 2>&1 &
+  NUT_WORKER_PID=$!
+fi
 
-DEADLINE=$((SECONDS + 20))
+DEADLINE=$((SECONDS + 60))
 FOUND_COUNT=0
 FOUND_STATUS=""
+NEW_MID=""
 while (( SECONDS < DEADLINE )); do
   if [[ -f "$NUT_DB_PATH" ]]; then
-    FOUND_COUNT=$(sqlite3 "$NUT_DB_PATH" \
-      "SELECT COUNT(*) FROM $NUT_MESSAGES_TABLE WHERE direction='$NUT_MESSAGES_DIRECTION' AND id > $BASELINE_MAX_ID;" \
-      2>/dev/null || echo "0")
-    if [[ "$FOUND_COUNT" -ge 1 ]]; then
+    sqlite3 "$NUT_DB_PATH" \
+      "SELECT message_id FROM $NUT_MESSAGES_TABLE WHERE direction='$NUT_MESSAGES_DIRECTION';" \
+      2>/dev/null | sort -u > "$CURRENT_FILE" || true
+    # comm -13 emits lines unique to the second file (i.e. new since baseline).
+    NEW_MID=$(comm -13 "$BASELINE_FILE" "$CURRENT_FILE" | tail -1)
+    if [[ -n "$NEW_MID" ]]; then
+      FOUND_COUNT=1
       FOUND_STATUS=$(sqlite3 "$NUT_DB_PATH" \
-        "SELECT status FROM $NUT_MESSAGES_TABLE WHERE direction='$NUT_MESSAGES_DIRECTION' AND id > $BASELINE_MAX_ID ORDER BY id DESC LIMIT 1;" \
+        "SELECT status FROM $NUT_MESSAGES_TABLE WHERE message_id='$NEW_MID' LIMIT 1;" \
         2>/dev/null || echo "")
-      break
+      # Terminal-state shortcut. If the status is still RECEIVED / queued,
+      # we keep polling (and re-kicking the NUT worker) until either it
+      # reaches a terminal state or the budget runs out.
+      case "$FOUND_STATUS" in
+        DELIVERED|delivered|DECRYPTED|decrypted|QUARANTINED|quarantined|FAILED|failed) break ;;
+      esac
     fi
+  fi
+  # Re-kick the NUT worker if our background drain has exited and the
+  # inbound row is still in a non-terminal state — drains are one-shot,
+  # so we need a new process each pass to walk the remaining jobs.
+  if [[ -n "${NUT_WORKER_CMD:-}" ]] && ! kill -0 "$NUT_WORKER_PID" 2>/dev/null; then
+    bash -c "$NUT_WORKER_CMD" >/dev/null 2>&1 &
+    NUT_WORKER_PID=$!
   fi
   sleep 0.5
 done
+[[ -n "$NUT_WORKER_PID" ]] && kill "$NUT_WORKER_PID" 2>/dev/null || true
+rm -f "$BASELINE_FILE" "$CURRENT_FILE"
 
 if [[ "$FOUND_COUNT" -ge 1 ]]; then
-  pass 04.03 "NUT received the inbound envelope from peer ($FOUND_COUNT row)"
+  pass 04.03 "NUT received the inbound envelope from peer (message_id=$NEW_MID)"
   case "$FOUND_STATUS" in
-    DELIVERED|delivered)
+    DELIVERED|delivered|DECRYPTED|decrypted)
+      # Both states prove the JWE was decrypted+verified — DECRYPTED is the
+      # canonical intermediate in PHP's inbound flow (RECEIVED → DECRYPTED
+      # → DELIVERED) and DELIVERED is the terminal state in both PHP and
+      # Go nodes.
       pass 04.04 "NUT decrypted+verified the JWE (status=$FOUND_STATUS)"
+      ;;
+    RECEIVED|received|PENDING|pending)
+      # The envelope landed but the NUT's worker never advanced status.
+      # That's fine for proving 04.03 (delivery interop), but means we
+      # can't conclude 04.04 (decrypt+verify). Surface this honestly so
+      # operators know whether to provide a NUT_WORKER_CMD.
+      fail 04.04 "NUT decrypted+verified the JWE" \
+        "status=$FOUND_STATUS — envelope received but inbound worker never ran (provide --node-worker-cmd?)"
       ;;
     QUARANTINED|quarantined)
       fail 04.04 "NUT decrypted+verified the JWE" \
@@ -120,7 +175,7 @@ if [[ "$FOUND_COUNT" -ge 1 ]]; then
   esac
 else
   fail 04.03 "NUT received the inbound envelope from peer" \
-    "no new inbound row in $NUT_MESSAGES_TABLE within 20s (baseline_max_id=$BASELINE_MAX_ID)"
+    "no new inbound row in $NUT_MESSAGES_TABLE within 20s"
 fi
 
 print_bucket_summary 04 Receive
