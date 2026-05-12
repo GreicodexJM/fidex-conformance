@@ -110,6 +110,25 @@ fi
 
 # ── Boot reference peer ───────────────────────────────────────────────────
 if [[ "$PEER_TYPE" == "php" ]]; then
+  # PHP peer requires RSA key pairs (sign + enc). The bootstrap loads them
+  # if they exist; otherwise /health reports degraded and returns 503 — which
+  # `curl -fsS` treats as a hard failure. Generate them on demand so CI jobs
+  # that only install dependencies still get a healthy peer.
+  if [[ ! -f "$PEER_REPO/keys/sign_private.pem" || ! -f "$PEER_REPO/keys/enc_private.pem" ]]; then
+    say "Generating reference peer keys (missing in $PEER_REPO/keys/) ..."
+    (cd "$PEER_REPO" && rm -f keys/*.pem && php bin/generate-keys.php >/dev/null 2>&1) \
+      || warn "peer key generation reported errors — health check may still fail"
+  fi
+  # Ensure the peer DB schema exists before the server first touches PDO.
+  # We previously ran migrate.php AFTER the health-check loop, but /health
+  # itself does a SELECT against the queue and a clean sqlite file works fine
+  # for that; the explicit migrate is still useful for the partner/message
+  # tables exercised by the test buckets.
+  (cd "$PEER_REPO" \
+    && FIDEX_DB_DRIVER=sqlite \
+       FIDEX_DB_PATH="$PEER_DIR/fidex.sqlite" \
+       php bin/migrate.php >/dev/null 2>&1) || warn "peer migration printed errors"
+
   say "Starting reference peer (FideX-php) on :$PEER_PORT ..."
   if [[ -f "$PEER_REPO/.env" ]]; then mv "$PEER_REPO/.env" "$PEER_REPO/.env.bak.conformance"; fi
   (cd "$PEER_REPO" \
@@ -122,8 +141,19 @@ if [[ "$PEER_TYPE" == "php" ]]; then
        FIDEX_ALLOW_HTTP_REGISTRATION=true \
        nohup php -S 0.0.0.0:"$PEER_PORT" -t "$PEER_REPO/public/" "$PEER_REPO/public/index.php" > "$PEER_DIR/peer.log" 2>&1 &)
   DEADLINE=$((SECONDS + 15))
+  LAST_HEALTH_CODE=
+  LAST_HEALTH_BODY=
   until curl -fsS "http://localhost:$PEER_PORT/health" >/dev/null 2>&1; do
     if (( SECONDS > DEADLINE )); then
+      # Capture the actual response so we know if it's a 503 (degraded —
+      # usually missing keys), a 500 (bootstrap fatal), or a 404 (route
+      # not mounted). The access log alone doesn't reveal the status code.
+      LAST_HEALTH_BODY=$(curl -sS -o - -w "HTTP_CODE=%{http_code}\n" \
+        "http://localhost:$PEER_PORT/health" 2>&1 || echo "(curl failed)")
+      printf "%s---- /health probe result ----%s\n" "$RED" "$NC" >&2
+      printf "%s\n" "$LAST_HEALTH_BODY" >&2
+      printf "%s---- peer.log (first 50 lines) ----%s\n" "$RED" "$NC" >&2
+      head -50 "$PEER_DIR/peer.log" >&2 2>/dev/null || echo "(peer.log absent)" >&2
       printf "%s---- peer.log (last 50 lines) ----%s\n" "$RED" "$NC" >&2
       tail -50 "$PEER_DIR/peer.log" >&2 2>/dev/null || echo "(peer.log absent)" >&2
       printf "%s---- end peer.log ----%s\n" "$RED" "$NC" >&2
@@ -131,11 +161,6 @@ if [[ "$PEER_TYPE" == "php" ]]; then
     fi
     sleep 0.3
   done
-  # Run peer migration (idempotent).
-  (cd "$PEER_REPO" \
-    && FIDEX_DB_DRIVER=sqlite \
-       FIDEX_DB_PATH="$PEER_DIR/fidex.sqlite" \
-       php bin/migrate.php >/dev/null 2>&1) || warn "peer migration printed errors"
   say "Reference peer healthy at http://localhost:$PEER_PORT"
 else
   # Go reference peer. Expects a pre-built binary at $PEER_REPO/fidex-node or
