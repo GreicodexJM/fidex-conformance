@@ -102,7 +102,12 @@ if [[ -f "$PEER_REPO/.env" ]]; then mv "$PEER_REPO/.env" "$PEER_REPO/.env.bak.co
      nohup php -S 0.0.0.0:"$PEER_PORT" -t "$PEER_REPO/public/" "$PEER_REPO/public/index.php" > "$PEER_DIR/peer.log" 2>&1 &)
 DEADLINE=$((SECONDS + 15))
 until curl -fsS "http://localhost:$PEER_PORT/health" >/dev/null 2>&1; do
-  (( SECONDS > DEADLINE )) && die "reference peer never became healthy. log: $PEER_DIR/peer.log"
+  if (( SECONDS > DEADLINE )); then
+    printf "%s---- peer.log (last 50 lines) ----%s\n" "$RED" "$NC" >&2
+    tail -50 "$PEER_DIR/peer.log" >&2 2>/dev/null || echo "(peer.log absent)" >&2
+    printf "%s---- end peer.log ----%s\n" "$RED" "$NC" >&2
+    die "reference peer never became healthy"
+  fi
   sleep 0.3
 done
 # Run peer migration (idempotent).
